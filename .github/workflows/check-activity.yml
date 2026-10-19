@@ -1,0 +1,80 @@
+name: Activity check
+
+on:
+  schedule:
+    # Mondays at 06:17 UTC, off the top of the hour when scheduled runs pile up.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: activity-check
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+      BRANCH: automated/activity-check
+    steps:
+      # Always check the default branch, even when a run is started from another branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check project activity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-activity.mjs README.md "$RUNNER_TEMP"
+
+      - name: Add the report to the job summary
+        run: cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open, update, or close the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          outcome=$(cat "$RUNNER_TEMP/outcome")
+          open_pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          case "$outcome" in
+            clean)
+              if [ -n "$open_pr" ]; then
+                gh pr close "$open_pr" --delete-branch --comment 'Every checked entry passes the activity check now.'
+              fi
+              ;;
+            unclear)
+              # Nothing fails, but some entries could not be checked, so a person decides.
+              if [ -n "$open_pr" ]; then
+                {
+                  echo 'Nothing fails the activity check this week, but some entries could not be checked. This pull request stays open for a manual look.'
+                  echo
+                  cat "$RUNNER_TEMP/report.md"
+                } > "$RUNNER_TEMP/comment.md"
+                gh pr comment "$open_pr" --body-file "$RUNNER_TEMP/comment.md"
+              fi
+              ;;
+            removed)
+              git config user.name 'github-actions[bot]'
+              git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+              git switch -C "$BRANCH"
+              git commit --quiet -F "$RUNNER_TEMP/commit-message.txt" -- README.md
+              git push --force origin "$BRANCH"
+
+              if [ -n "$open_pr" ]; then
+                gh pr edit "$open_pr" --body-file "$RUNNER_TEMP/report.md"
+              else
+                gh pr create --base "$BASE" --head "$BRANCH" \
+                  --title 'Remove projects that fail the activity rule' \
+                  --body-file "$RUNNER_TEMP/report.md"
+              fi
+              ;;
+            *)
+              echo "Unknown outcome: $outcome" >&2
+              exit 1
+              ;;
+          esac

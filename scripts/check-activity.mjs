@@ -1,0 +1,344 @@
+// Weekly activity check for the list.
+//
+// An entry passes when its project is not archived and has a release (a GitHub
+// release or a tag) or a commit on its default branch within the last 12
+// months. Entries that fail are removed from the README, and the workflow turns
+// that change into a pull request for review. Anything that needs a person to
+// decide (a missing repository, a moved repository, a repository with too many
+// releases or tags to read in full, an entry with no repository to check) is
+// only reported, never removed.
+//
+// Usage: node scripts/check-activity.mjs <readme> <output-dir>
+// Writes <output-dir>/report.md and <output-dir>/outcome, plus
+// <output-dir>/commit-message.txt when entries were removed. The outcome is
+// "removed" when entries were removed, "unclear" when nothing was removed but
+// some entries could not be judged, and "clean" otherwise.
+// GITHUB_TOKEN must allow reading public repositories.
+
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+// Entries that link to documentation or a product page, but whose releases
+// come from a GitHub repository.
+const SOURCE_REPOS = {
+  'https://kafka.apache.org/documentation/#basic_ops': 'apache/kafka',
+  'https://kafka.apache.org/documentation/#api': 'apache/kafka',
+  'https://kafka.apache.org/documentation/streams/': 'apache/kafka',
+  'https://kafka.apache.org/documentation/#georeplication': 'apache/kafka',
+  'https://iceberg.apache.org/docs/latest/kafka-connect/': 'apache/iceberg',
+  'https://testcontainers.com/modules/kafka/': 'testcontainers/testcontainers-java',
+  'https://factorhouse.io/kpow/': 'factorhouse/kpow',
+};
+
+// Repositories per GraphQL request, kept well below the API's node limits.
+const BATCH_SIZE = 25;
+
+// Releases and tags per page, the most the API returns at once.
+const PAGE_SIZE = 100;
+
+// Neither list can be sorted by the date that counts: releases sort by when
+// they were created rather than published, and tags by the date of the commit
+// they point to. So before removing a project, every page of both lists is
+// read. A repository with more pages than this is reported instead.
+const MAX_PAGES = 20;
+
+const RELEASE_PAGE = 'pageInfo { hasNextPage endCursor } nodes { publishedAt }';
+
+// An annotated tag carries its own date; a lightweight tag only has its commit's.
+const TAG_PAGE = `pageInfo { hasNextPage endCursor }
+    nodes {
+      target {
+        ... on Commit { committedDate }
+        ... on Tag { tagger { date } target { ... on Commit { committedDate } } }
+      }
+    }`;
+
+const RELEASE_ORDER = 'orderBy: { field: CREATED_AT, direction: DESC }';
+const TAG_ORDER = 'refPrefix: "refs/tags/", orderBy: { field: TAG_COMMIT_DATE, direction: DESC }';
+
+const REPO_FIELDS = `
+  nameWithOwner
+  isArchived
+  defaultBranchRef { target { ... on Commit { committedDate } } }
+  releases(first: ${PAGE_SIZE}, ${RELEASE_ORDER}) { ${RELEASE_PAGE} }
+  refs(first: ${PAGE_SIZE}, ${TAG_ORDER}) { ${TAG_PAGE} }`;
+
+const [readmePath, outDir] = process.argv.slice(2);
+if (!readmePath || !outDir) {
+  console.error('Usage: node scripts/check-activity.mjs <readme> <output-dir>');
+  process.exit(2);
+}
+const token = process.env.GITHUB_TOKEN;
+if (!token) {
+  console.error('GITHUB_TOKEN is not set.');
+  process.exit(2);
+}
+
+const today = new Date();
+const cutoff = new Date(today);
+cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
+const day = (date) => date.toISOString().slice(0, 10);
+
+const lines = readFileSync(readmePath, 'utf8').split('\n');
+const entries = parseEntries(lines);
+const repos = [...new Set(entries.map((entry) => entry.repo).filter(Boolean))];
+const status = await fetchStatus(repos);
+for (const repo of status.values()) {
+  if (!repo.isArchived && !isActive(repo) && (repo.releaseCursor || repo.tagCursor)) {
+    await readRemainingPages(repo);
+  }
+}
+
+const removed = [];
+const notFound = [];
+const moved = [];
+const incomplete = [];
+const unchecked = [];
+for (const entry of entries) {
+  if (!entry.repo) {
+    unchecked.push(entry);
+    continue;
+  }
+  const repo = status.get(entry.repo.toLowerCase());
+  if (!repo) {
+    notFound.push(entry);
+    continue;
+  }
+  if (repo.nameWithOwner.toLowerCase() !== entry.repo.toLowerCase()) {
+    moved.push({ ...entry, movedTo: repo.nameWithOwner });
+    continue;
+  }
+  if (repo.isArchived) {
+    removed.push({ ...entry, ...repo, reason: 'Archived' });
+  } else if (!isActive(repo)) {
+    if (repo.incomplete) incomplete.push(entry);
+    else removed.push({ ...entry, ...repo, reason: 'No recent activity' });
+  }
+}
+
+const removedLines = new Set(removed.map((entry) => entry.index));
+const kept = lines.filter((_, index) => !removedLines.has(index));
+const emptySections = findEmptySections(kept);
+
+const unclear = notFound.length + moved.length + incomplete.length > 0;
+const outcome = removed.length > 0 ? 'removed' : unclear ? 'unclear' : 'clean';
+writeFileSync(join(outDir, 'report.md'), buildReport());
+writeFileSync(join(outDir, 'outcome'), `${outcome}\n`);
+if (removed.length > 0) {
+  writeFileSync(readmePath, kept.join('\n'));
+  writeFileSync(join(outDir, 'commit-message.txt'), buildCommitMessage());
+}
+
+console.log(
+  `Checked ${entries.length} entries against ${repos.length} repositories: ` +
+    `${removed.length} removed, ${notFound.length} not found, ${moved.length} moved, ` +
+    `${incomplete.length} not read in full, ${unchecked.length} without a repository.`,
+);
+
+function parseEntries(readmeLines) {
+  const found = [];
+  let section = '';
+  readmeLines.forEach((line, index) => {
+    const heading = line.match(/^#{2,3} (.+)$/);
+    if (heading) {
+      section = heading[1];
+      return;
+    }
+    const item = line.match(/^- \[([^\]]+)\]\((https?:\/\/[^)]+)\)/);
+    if (item) {
+      found.push({ index, name: item[1], link: item[2], section, repo: repoFor(item[2]) });
+    }
+  });
+  return found;
+}
+
+function repoFor(link) {
+  const github = link.match(/^https:\/\/github\.com\/([^/#?]+)\/([^/#?]+)/);
+  return github ? `${github[1]}/${github[2]}` : (SOURCE_REPOS[link] ?? null);
+}
+
+function repositoryArgs(name) {
+  const [owner, repo] = name.split('/');
+  return `owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}`;
+}
+
+async function fetchStatus(names) {
+  const result = new Map();
+  for (let start = 0; start < names.length; start += BATCH_SIZE) {
+    const batch = names.slice(start, start + BATCH_SIZE);
+    const fields = batch.map((name, i) => `r${i}: repository(${repositoryArgs(name)}) {${REPO_FIELDS}}`);
+    const response = await graphql(`query {\n${fields.join('\n')}\n}`);
+    const unexpected = (response.errors ?? []).filter((error) => error.type !== 'NOT_FOUND');
+    if (unexpected.length > 0) {
+      throw new Error(`GitHub API errors: ${JSON.stringify(unexpected)}`);
+    }
+    batch.forEach((name, i) => {
+      const repo = response.data?.[`r${i}`];
+      if (repo) result.set(name.toLowerCase(), summarize(repo));
+    });
+  }
+  return result;
+}
+
+// Reads the remaining release and tag pages of a repository that would
+// otherwise be removed, stopping as soon as a recent date turns up.
+async function readRemainingPages(repo) {
+  for (let page = 2; page <= MAX_PAGES; page++) {
+    const fields = [];
+    if (repo.releaseCursor) {
+      fields.push(`releases(first: ${PAGE_SIZE}, after: ${JSON.stringify(repo.releaseCursor)}, ${RELEASE_ORDER}) { ${RELEASE_PAGE} }`);
+    }
+    if (repo.tagCursor) {
+      fields.push(`refs(first: ${PAGE_SIZE}, after: ${JSON.stringify(repo.tagCursor)}, ${TAG_ORDER}) { ${TAG_PAGE} }`);
+    }
+    const response = await graphql(`query {\nrepository(${repositoryArgs(repo.nameWithOwner)}) {\n${fields.join('\n')}\n}\n}`);
+    if (response.errors?.length > 0) {
+      throw new Error(`GitHub API errors: ${JSON.stringify(response.errors)}`);
+    }
+    const { releases, refs } = response.data.repository;
+    if (releases) {
+      repo.lastRelease = latest([repo.lastRelease, ...releaseDates(releases)]);
+      repo.releaseCursor = nextCursor(releases);
+    }
+    if (refs) {
+      repo.lastRelease = latest([repo.lastRelease, ...tagDates(refs)]);
+      repo.tagCursor = nextCursor(refs);
+    }
+    if (isActive(repo) || (!repo.releaseCursor && !repo.tagCursor)) return;
+  }
+  repo.incomplete = true;
+}
+
+async function graphql(query) {
+  const response = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'user-agent': 'awesome-kafka-activity-check',
+    },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub API returned ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+function summarize(repo) {
+  return {
+    nameWithOwner: repo.nameWithOwner,
+    isArchived: repo.isArchived,
+    lastRelease: latest([...releaseDates(repo.releases), ...tagDates(repo.refs)]),
+    lastCommit: latest([repo.defaultBranchRef?.target?.committedDate]),
+    releaseCursor: nextCursor(repo.releases),
+    tagCursor: nextCursor(repo.refs),
+    incomplete: false,
+  };
+}
+
+function releaseDates(connection) {
+  return connection.nodes.map((release) => release.publishedAt);
+}
+
+function tagDates(connection) {
+  return connection.nodes.map(({ target }) => target?.tagger?.date ?? target?.target?.committedDate ?? target?.committedDate);
+}
+
+function nextCursor(connection) {
+  return connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
+}
+
+function isActive(repo) {
+  return [repo.lastRelease, repo.lastCommit].some((date) => date && date >= cutoff);
+}
+
+function latest(values) {
+  const dates = values.filter(Boolean).map((value) => new Date(value));
+  return dates.length > 0 ? new Date(Math.max(...dates)) : null;
+}
+
+// A heading is empty when no entry appears before the next heading of the same
+// or a higher level, so a parent heading with filled subsections still counts.
+function findEmptySections(readmeLines) {
+  const empty = [];
+  readmeLines.forEach((line, index) => {
+    const heading = line.match(/^(#{2,3}) (.+)$/);
+    if (!heading || heading[2] === 'Contents') return;
+    let hasEntries = false;
+    for (const next of readmeLines.slice(index + 1)) {
+      const nextHeading = next.match(/^(#{2,3}) /);
+      if (nextHeading && nextHeading[1].length <= heading[1].length) break;
+      if (/^- \[[^\]]+\]\(https?:\/\//.test(next)) {
+        hasEntries = true;
+        break;
+      }
+    }
+    if (!hasEntries) empty.push(heading[2]);
+  });
+  return empty;
+}
+
+function formatDate(date) {
+  return date ? day(date) : 'none';
+}
+
+function buildReport() {
+  const out = [`## Activity check, ${day(today)}`, ''];
+  out.push(
+    `A project stays on the list when it is not archived and has a release (a GitHub release or a tag) or a commit on its default branch since ${day(cutoff)}.`,
+    '',
+  );
+  if (removed.length > 0) {
+    out.push(`### Removed (${removed.length})`, '');
+    out.push('| Project | Section | Reason | Last release | Last commit |', '|---|---|---|---|---|');
+    for (const entry of removed) {
+      out.push(
+        `| [${entry.name}](${entry.link}) | ${entry.section} | ${entry.reason} | ${formatDate(entry.lastRelease)} | ${formatDate(entry.lastCommit)} |`,
+      );
+    }
+    out.push('');
+  } else {
+    out.push('### Removed', '', 'Nothing. Every checked entry passes.', '');
+  }
+
+  const manual = [];
+  for (const entry of notFound) {
+    manual.push(`- Repository not found: [${entry.name}](${entry.link}) (${entry.repo}). It may have been deleted or made private.`);
+  }
+  for (const entry of moved) {
+    manual.push(`- Repository moved: [${entry.name}](${entry.link}) now resolves to ${entry.movedTo}. Update the link; the entry is not checked until then.`);
+  }
+  for (const entry of incomplete) {
+    manual.push(
+      `- Too many releases or tags to read in full: [${entry.name}](${entry.link}). The first ${MAX_PAGES * PAGE_SIZE} of each show no recent activity, so check it by hand.`,
+    );
+  }
+  for (const section of emptySections) {
+    manual.push(`- Section "${section}" has no entries left. Remove its heading and its Contents link.`);
+  }
+  if (unchecked.length > 0) {
+    manual.push(`- No repository to check (${unchecked.length}): ${unchecked.map((entry) => entry.name).join(', ')}.`);
+  }
+  if (manual.length > 0) {
+    out.push('### Needs a manual check', '', ...manual, '');
+  }
+
+  out.push(`Checked ${entries.length} entries against ${repos.length} repositories.`);
+  if (removed.length > 0) {
+    out.push('', 'The weekly check rewrites this branch on every run, so make other edits on the default branch.');
+  }
+  return `${out.join('\n')}\n`;
+}
+
+function buildCommitMessage() {
+  return [
+    'Remove projects that fail the activity rule',
+    '',
+    'The weekly activity check found these projects archived, or without',
+    `a release or a commit since ${day(cutoff)}:`,
+    '',
+    ...removed.map((entry) => `- ${entry.name}`),
+    '',
+  ].join('\n');
+}
