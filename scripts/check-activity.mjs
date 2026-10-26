@@ -5,8 +5,9 @@
 // months. Entries that fail are removed from the README, and the workflow turns
 // that change into a pull request for review. Anything that needs a person to
 // decide (a missing repository, a moved repository, a repository with too many
-// releases or tags to read in full, an entry with no repository to check) is
-// only reported, never removed.
+// releases or tags to read in full, a repository whose organization blocks the
+// API token and that shows no recent commit, an entry with no repository to
+// check) is only reported, never removed.
 //
 // Usage: node scripts/check-activity.mjs <readme> <output-dir>
 // Writes <output-dir>/report.md and <output-dir>/outcome, plus
@@ -53,6 +54,8 @@ const TAG_PAGE = `pageInfo { hasNextPage endCursor }
       }
     }`;
 
+const USER_AGENT = 'awesome-kafka-activity-check';
+
 const RELEASE_ORDER = 'orderBy: { field: CREATED_AT, direction: DESC }';
 const TAG_ORDER = 'refPrefix: "refs/tags/", orderBy: { field: TAG_COMMIT_DATE, direction: DESC }';
 
@@ -93,6 +96,7 @@ const removed = [];
 const notFound = [];
 const moved = [];
 const incomplete = [];
+const restricted = [];
 const unchecked = [];
 for (const entry of entries) {
   if (!entry.repo) {
@@ -111,7 +115,8 @@ for (const entry of entries) {
   if (repo.isArchived) {
     removed.push({ ...entry, ...repo, reason: 'Archived' });
   } else if (!isActive(repo)) {
-    if (repo.incomplete) incomplete.push(entry);
+    if (repo.restricted) restricted.push({ ...entry, lastCommit: repo.lastCommit });
+    else if (repo.incomplete) incomplete.push(entry);
     else removed.push({ ...entry, ...repo, reason: 'No recent activity' });
   }
 }
@@ -120,7 +125,7 @@ const removedLines = new Set(removed.map((entry) => entry.index));
 const kept = lines.filter((_, index) => !removedLines.has(index));
 const emptySections = findEmptySections(kept);
 
-const unclear = notFound.length + moved.length + incomplete.length > 0;
+const unclear = notFound.length + moved.length + incomplete.length + restricted.length > 0;
 const outcome = removed.length > 0 ? 'removed' : unclear ? 'unclear' : 'clean';
 writeFileSync(join(outDir, 'report.md'), buildReport());
 writeFileSync(join(outDir, 'outcome'), `${outcome}\n`);
@@ -132,7 +137,8 @@ if (removed.length > 0) {
 console.log(
   `Checked ${entries.length} entries against ${repos.length} repositories: ` +
     `${removed.length} removed, ${notFound.length} not found, ${moved.length} moved, ` +
-    `${incomplete.length} not read in full, ${unchecked.length} without a repository.`,
+    `${incomplete.length} not read in full, ${restricted.length} blocked by their organization, ` +
+    `${unchecked.length} without a repository.`,
 );
 
 function parseEntries(readmeLines) {
@@ -168,7 +174,16 @@ async function fetchStatus(names) {
     const batch = names.slice(start, start + BATCH_SIZE);
     const fields = batch.map((name, i) => `r${i}: repository(${repositoryArgs(name)}) {${REPO_FIELDS}}`);
     const response = await graphql(`query {\n${fields.join('\n')}\n}`);
-    const unexpected = (response.errors ?? []).filter((error) => error.type !== 'NOT_FOUND');
+    const blocked = [];
+    const unexpected = [];
+    for (const error of response.errors ?? []) {
+      // FORBIDDEN on a whole repository means its organization restricts the
+      // token, with an IP allow list for example.
+      const name = error.path?.length === 1 ? batch[Number(error.path[0].slice(1))] : undefined;
+      if (error.type === 'NOT_FOUND') continue;
+      if (error.type === 'FORBIDDEN' && name) blocked.push(name);
+      else unexpected.push(error);
+    }
     if (unexpected.length > 0) {
       throw new Error(`GitHub API errors: ${JSON.stringify(unexpected)}`);
     }
@@ -176,8 +191,53 @@ async function fetchStatus(names) {
       const repo = response.data?.[`r${i}`];
       if (repo) result.set(name.toLowerCase(), summarize(repo));
     });
+    for (const name of blocked) {
+      const repo = await fetchWithoutToken(name);
+      if (repo) result.set(name.toLowerCase(), repo);
+    }
   }
   return result;
+}
+
+// Some organizations only allow API access from their own IP addresses, and
+// GitHub applies that to the workflow's token even for public repositories.
+// Signed-out requests to github.com are not affected, so these repositories are
+// read from their page (whether they are archived) and their commit feed (the
+// latest commit on the default branch). Neither lists every release and tag, so
+// a repository without a recent commit is reported instead of removed, and so
+// is one whose page or feed cannot be read.
+async function fetchWithoutToken(name) {
+  const repo = {
+    nameWithOwner: name,
+    isArchived: false,
+    lastRelease: null,
+    lastCommit: null,
+    releaseCursor: null,
+    tagCursor: null,
+    incomplete: false,
+    restricted: true,
+  };
+  const page = await fetch(`https://github.com/${name}`, { headers: { 'user-agent': USER_AGENT } });
+  if (page.status === 404) return null;
+  if (!page.ok) return repo;
+
+  // A renamed or transferred repository redirects to its new address. The page
+  // also describes other repositories, such as the parent of a fork, so the
+  // archived flag is taken from the object for this one.
+  const current = new URL(page.url).pathname.split('/').slice(1, 3).join('/').toLowerCase();
+  const html = await page.text();
+  const match = [...html.matchAll(/"name":"([^"]+)","ownerLogin":"([^"]+)"[^}]*?"isArchived":(true|false)/g)].find(
+    ([, repoName, owner]) => `${owner}/${repoName}`.toLowerCase() === current,
+  );
+  if (!match) return repo;
+  repo.nameWithOwner = `${match[2]}/${match[1]}`;
+  repo.isArchived = match[3] === 'true';
+
+  const feed = await fetch(`https://github.com/${repo.nameWithOwner}/commits.atom`, { headers: { 'user-agent': USER_AGENT } });
+  if (feed.ok) {
+    repo.lastCommit = latest([...(await feed.text()).matchAll(/<updated>([^<]+)<\/updated>/g)].map((date) => date[1]));
+  }
+  return repo;
 }
 
 // Reads the remaining release and tag pages of a repository that would
@@ -215,7 +275,7 @@ async function graphql(query) {
     headers: {
       authorization: `Bearer ${token}`,
       'content-type': 'application/json',
-      'user-agent': 'awesome-kafka-activity-check',
+      'user-agent': USER_AGENT,
     },
     body: JSON.stringify({ query }),
   });
@@ -314,6 +374,13 @@ function buildReport() {
       `- Too many releases or tags to read in full: [${entry.name}](${entry.link}). The first ${MAX_PAGES * PAGE_SIZE} of each show no recent activity, so check it by hand.`,
     );
   }
+  for (const entry of restricted) {
+    manual.push(
+      entry.lastCommit
+        ? `- Not fully checked: [${entry.name}](${entry.link}). Its organization blocks the API token, and without it only the default branch could be read, last commit ${day(entry.lastCommit)}. Check its releases and tags by hand.`
+        : `- Not checked: [${entry.name}](${entry.link}). Its organization blocks the API token, and its page or commit feed on GitHub could not be read either.`,
+    );
+  }
   for (const section of emptySections) {
     manual.push(`- Section "${section}" has no entries left. Remove its heading and its Contents link.`);
   }
@@ -324,7 +391,11 @@ function buildReport() {
     out.push('### Needs a manual check', '', ...manual, '');
   }
 
-  out.push(`Checked ${entries.length} entries against ${repos.length} repositories.`);
+  const restrictedRepos = [...status.values()].filter((repo) => repo.restricted).length;
+  out.push(
+    `Checked ${entries.length} entries against ${repos.length} repositories` +
+      (restrictedRepos > 0 ? `, ${restrictedRepos} of them without the API token because their organization blocks it.` : '.'),
+  );
   if (removed.length > 0) {
     out.push('', 'The weekly check rewrites this branch on every run, so make other edits on the default branch.');
   }
