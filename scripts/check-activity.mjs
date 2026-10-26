@@ -18,6 +18,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 // Entries that link to documentation or a product page, but whose releases
 // come from a GitHub repository.
@@ -59,12 +60,15 @@ const USER_AGENT = 'awesome-kafka-activity-check';
 const RELEASE_ORDER = 'orderBy: { field: CREATED_AT, direction: DESC }';
 const TAG_ORDER = 'refPrefix: "refs/tags/", orderBy: { field: TAG_COMMIT_DATE, direction: DESC }';
 
+// Most repositories pass on these fields alone. Listing releases and tags is
+// the slow part, and a batch that lists them for every repository can run past
+// GitHub's time limit, so they are read one repository at a time and only for
+// those that would otherwise be removed.
 const REPO_FIELDS = `
   nameWithOwner
   isArchived
   defaultBranchRef { target { ... on Commit { committedDate } } }
-  releases(first: ${PAGE_SIZE}, ${RELEASE_ORDER}) { ${RELEASE_PAGE} }
-  refs(first: ${PAGE_SIZE}, ${TAG_ORDER}) { ${TAG_PAGE} }`;
+  latestRelease { publishedAt }`;
 
 const [readmePath, outDir] = process.argv.slice(2);
 if (!readmePath || !outDir) {
@@ -87,8 +91,8 @@ const entries = parseEntries(lines);
 const repos = [...new Set(entries.map((entry) => entry.repo).filter(Boolean))];
 const status = await fetchStatus(repos);
 for (const repo of status.values()) {
-  if (!repo.isArchived && !isActive(repo) && (repo.releaseCursor || repo.tagCursor)) {
-    await readRemainingPages(repo);
+  if (!repo.isArchived && !repo.restricted && !isActive(repo)) {
+    await readReleasesAndTags(repo);
   }
 }
 
@@ -212,8 +216,6 @@ async function fetchWithoutToken(name) {
     isArchived: false,
     lastRelease: null,
     lastCommit: null,
-    releaseCursor: null,
-    tagCursor: null,
     incomplete: false,
     restricted: true,
   };
@@ -251,59 +253,74 @@ async function fetchSignedOut(url) {
   }
 }
 
-// Reads the remaining release and tag pages of a repository that would
-// otherwise be removed, stopping as soon as a recent date turns up.
-async function readRemainingPages(repo) {
-  for (let page = 2; page <= MAX_PAGES; page++) {
+// Reads the release and tag pages of a repository that would otherwise be
+// removed, stopping as soon as a recent date turns up.
+async function readReleasesAndTags(repo) {
+  const releases = { cursor: null, more: true };
+  const tags = { cursor: null, more: true };
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const fields = [];
-    if (repo.releaseCursor) {
-      fields.push(`releases(first: ${PAGE_SIZE}, after: ${JSON.stringify(repo.releaseCursor)}, ${RELEASE_ORDER}) { ${RELEASE_PAGE} }`);
+    if (releases.more) {
+      fields.push(`releases(first: ${PAGE_SIZE}${after(releases.cursor)}, ${RELEASE_ORDER}) { ${RELEASE_PAGE} }`);
     }
-    if (repo.tagCursor) {
-      fields.push(`refs(first: ${PAGE_SIZE}, after: ${JSON.stringify(repo.tagCursor)}, ${TAG_ORDER}) { ${TAG_PAGE} }`);
+    if (tags.more) {
+      fields.push(`refs(first: ${PAGE_SIZE}${after(tags.cursor)}, ${TAG_ORDER}) { ${TAG_PAGE} }`);
     }
     const response = await graphql(`query {\nrepository(${repositoryArgs(repo.nameWithOwner)}) {\n${fields.join('\n')}\n}\n}`);
     if (response.errors?.length > 0) {
       throw new Error(`GitHub API errors: ${JSON.stringify(response.errors)}`);
     }
-    const { releases, refs } = response.data.repository;
-    if (releases) {
-      repo.lastRelease = latest([repo.lastRelease, ...releaseDates(releases)]);
-      repo.releaseCursor = nextCursor(releases);
+    const data = response.data.repository;
+    if (data.releases) {
+      repo.lastRelease = latest([repo.lastRelease, ...releaseDates(data.releases)]);
+      releases.cursor = data.releases.pageInfo.endCursor;
+      releases.more = data.releases.pageInfo.hasNextPage;
     }
-    if (refs) {
-      repo.lastRelease = latest([repo.lastRelease, ...tagDates(refs)]);
-      repo.tagCursor = nextCursor(refs);
+    if (data.refs) {
+      repo.lastRelease = latest([repo.lastRelease, ...tagDates(data.refs)]);
+      tags.cursor = data.refs.pageInfo.endCursor;
+      tags.more = data.refs.pageInfo.hasNextPage;
     }
-    if (isActive(repo) || (!repo.releaseCursor && !repo.tagCursor)) return;
+    if (isActive(repo) || (!releases.more && !tags.more)) return;
   }
   repo.incomplete = true;
 }
 
+function after(cursor) {
+  return cursor ? `, after: ${JSON.stringify(cursor)}` : '';
+}
+
+// A 502, 503, or 504 means GitHub could not answer in time or was briefly
+// unavailable, so those and network errors get two more tries. The body is read
+// before deciding, since a connection can also break after the status arrives.
 async function graphql(query) {
-  const response = await fetch('https://api.github.com/graphql', {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      'user-agent': USER_AGENT,
-    },
-    body: JSON.stringify({ query }),
-  });
-  if (!response.ok) {
-    throw new Error(`GitHub API returned ${response.status}: ${await response.text()}`);
+  for (let attempt = 1; ; attempt++) {
+    const result = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'user-agent': USER_AGENT,
+      },
+      body: JSON.stringify({ query }),
+    })
+      .then(async (response) => ({ response, body: await response.text() }))
+      .catch((error) => ({ error }));
+    if (result.response?.ok) return JSON.parse(result.body);
+    const transient = result.error || [502, 503, 504].includes(result.response.status);
+    if (!transient || attempt === 3) {
+      throw result.error ?? new Error(`GitHub API returned ${result.response.status}: ${result.body}`);
+    }
+    await sleep(attempt * 5000);
   }
-  return response.json();
 }
 
 function summarize(repo) {
   return {
     nameWithOwner: repo.nameWithOwner,
     isArchived: repo.isArchived,
-    lastRelease: latest([...releaseDates(repo.releases), ...tagDates(repo.refs)]),
+    lastRelease: latest([repo.latestRelease?.publishedAt]),
     lastCommit: latest([repo.defaultBranchRef?.target?.committedDate]),
-    releaseCursor: nextCursor(repo.releases),
-    tagCursor: nextCursor(repo.refs),
     incomplete: false,
   };
 }
@@ -314,10 +331,6 @@ function releaseDates(connection) {
 
 function tagDates(connection) {
   return connection.nodes.map(({ target }) => target?.tagger?.date ?? target?.target?.committedDate ?? target?.committedDate);
-}
-
-function nextCursor(connection) {
-  return connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
 }
 
 function isActive(repo) {
