@@ -217,7 +217,7 @@ async function fetchWithoutToken(name) {
     incomplete: false,
     restricted: true,
   };
-  const page = await fetch(`https://github.com/${name}`, { headers: { 'user-agent': USER_AGENT } });
+  const page = await fetchSignedOut(`https://github.com/${name}`);
   if (page.status === 404) return null;
   if (!page.ok) return repo;
 
@@ -225,19 +225,30 @@ async function fetchWithoutToken(name) {
   // also describes other repositories, such as the parent of a fork, so the
   // archived flag is taken from the object for this one.
   const current = new URL(page.url).pathname.split('/').slice(1, 3).join('/').toLowerCase();
-  const html = await page.text();
-  const match = [...html.matchAll(/"name":"([^"]+)","ownerLogin":"([^"]+)"[^}]*?"isArchived":(true|false)/g)].find(
+  const match = [...page.text.matchAll(/"name":"([^"]+)","ownerLogin":"([^"]+)"[^}]*?"isArchived":(true|false)/g)].find(
     ([, repoName, owner]) => `${owner}/${repoName}`.toLowerCase() === current,
   );
   if (!match) return repo;
   repo.nameWithOwner = `${match[2]}/${match[1]}`;
   repo.isArchived = match[3] === 'true';
+  if (repo.isArchived) return repo;
 
-  const feed = await fetch(`https://github.com/${repo.nameWithOwner}/commits.atom`, { headers: { 'user-agent': USER_AGENT } });
+  const feed = await fetchSignedOut(`https://github.com/${repo.nameWithOwner}/commits.atom`);
   if (feed.ok) {
-    repo.lastCommit = latest([...(await feed.text()).matchAll(/<updated>([^<]+)<\/updated>/g)].map((date) => date[1]));
+    repo.lastCommit = latest([...feed.text.matchAll(/<updated>([^<]+)<\/updated>/g)].map((date) => date[1]));
   }
   return repo;
+}
+
+// A network error counts as a failed request, so the entry is reported
+// instead of stopping the whole check.
+async function fetchSignedOut(url) {
+  try {
+    const response = await fetch(url, { headers: { 'user-agent': USER_AGENT } });
+    return { status: response.status, ok: response.ok, url: response.url, text: response.ok ? await response.text() : '' };
+  } catch {
+    return { status: 0, ok: false, url, text: '' };
+  }
 }
 
 // Reads the remaining release and tag pages of a repository that would
@@ -313,8 +324,12 @@ function isActive(repo) {
   return [repo.lastRelease, repo.lastCommit].some((date) => date && date >= cutoff);
 }
 
+// Unparseable dates are skipped so that one of them cannot hide the others.
 function latest(values) {
-  const dates = values.filter(Boolean).map((value) => new Date(value));
+  const dates = values
+    .filter(Boolean)
+    .map((value) => new Date(value))
+    .filter((date) => !Number.isNaN(date.getTime()));
   return dates.length > 0 ? new Date(Math.max(...dates)) : null;
 }
 
